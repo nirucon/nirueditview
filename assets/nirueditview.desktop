@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NIRUEDITVIEW
+GenericName=Picture and PDF Viewer
+Comment=Look through photos and PDFs, make simple edits and sign documents
+Exec=nirueditview %F
+Icon=nirueditview
+Terminal=false
+Categories=Graphics;Viewer;RasterGraphics;Office;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/x-bmp;image/tiff;image/pjpeg;application/pdf;
+Keywords=photo;picture;image;viewer;slideshow;pdf;sign;signature;crop;rotate;
+StartupWMClass=nirueditview
