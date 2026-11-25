@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Screen geometry for tests/xvfb.sh: where the pad and the pages are in a
-screenshot, and whether the stamps in the signed PDF are where they were
-clicked (relative to their page)."""
+"""Screen geometry for tests/xvfb.sh: where the pad, the pages and the
+title are in a screenshot, whether found text is lit up, and whether the
+stamps in the signed PDF are where they were clicked (relative to their
+page)."""
 import os, subprocess, sys
 
 WIN_W, WIN_H = 1200, 860
@@ -78,6 +79,20 @@ elif cmd == "page2":
     l, t, w, h = page_box(sys.argv[2], 2)
     rx, ry = 0.60, 0.40
     print("C2X=%d C2Y=%d REL2X=%.4f REL2Y=%.4f" % (l + rx * w, t + ry * h, rx, ry))
+elif cmd == "found":
+    # Text found by Ctrl+F is lit up in orange (the current place).
+    w, h, px = ppm(sys.argv[2])
+    n = 0
+    for k in range(0, len(px) - 2, 3):
+        r, g, b = px[k], px[k + 1], px[k + 2]
+        if r > 235 and 150 < g < 220 and b < 170:
+            n += 1
+    print("orange pixels: %d" % n, file=sys.stderr)
+    sys.exit(0 if n > 30 else 1)
+elif cmd == "title":
+    # "Test form" on page 1: 72..173 across, 55..77 down, of 595 x 842.
+    l, t, w, h = page_box(sys.argv[2], 1)
+    print("TX0=%d TX1=%d TY=%d" % (l + 0.115 * w, l + 0.30 * w, t + 0.078 * h))
 elif cmd == "check":
     orig, signed, tmp = sys.argv[2:5]
     r1 = (float(sys.argv[5]), float(sys.argv[6]))

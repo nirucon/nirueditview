@@ -45,6 +45,18 @@ impl Page {
         (self.x0 + x, self.y0 + y)
     }
 
+    /// A point in PDF user space on the shown page: the inverse of `to_pdf`.
+    pub fn shown_of(self, x: f64, y: f64) -> (f64, f64) {
+        let (cw, ch) = (self.crop_w(), self.crop_h());
+        let (x, y) = (x - self.x0, y - self.y0);
+        match self.rot % 360 {
+            90 => (y, x),
+            180 => (cw - x, y),
+            270 => (ch - y, cw - x),
+            _ => (x, ch - y),
+        }
+    }
+
     /// The matrix that maps the unit square (an image, x right and y up) on
     /// to the shown rectangle (u, v, w, h), upright as it is seen.
     pub fn matrix(self, u: f64, v: f64, w: f64, h: f64) -> [f64; 6] {
@@ -60,6 +72,8 @@ pub struct Info {
     pub pages: Vec<Page>,
     pub encrypted: bool,
     pub title: String,
+    /// The PDF has a form to fill in (pdfinfo says "Form: AcroForm").
+    pub form: bool,
 }
 
 /// Parse `pdfinfo -f 1 -l N -box`.
@@ -67,6 +81,7 @@ pub fn parse_info(text: &str) -> Info {
     let mut count = 0usize;
     let mut encrypted = false;
     let mut title = String::new();
+    let mut form = false;
     let mut pages: Vec<Page> = Vec::new();
     type Boxes = (Option<[f64; 4]>, Option<[f64; 4]>, u32);
     let mut boxes: std::collections::BTreeMap<usize, Boxes> = Default::default();
@@ -77,6 +92,8 @@ pub fn parse_info(text: &str) -> Info {
             encrypted = v.trim().starts_with("yes");
         } else if let Some(v) = line.strip_prefix("Title:") {
             title = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Form:") {
+            form = v.trim() == "AcroForm";
         } else if let Some(rest) = line.strip_prefix("Page") {
             let mut it = rest.split_whitespace();
             let Some(n) = it.next().and_then(|n| n.parse::<usize>().ok()) else {
@@ -108,6 +125,7 @@ pub fn parse_info(text: &str) -> Info {
         pages,
         encrypted,
         title,
+        form,
     }
 }
 
@@ -423,12 +441,14 @@ fn add_resource(
     Ok(())
 }
 
-/// Write `stamps` into a copy of `src` at `dst` (an incremental update).
+/// Write `stamps` and the changed form `fields` into a copy of `src` at
+/// `dst` (an incremental update).
 pub fn write_stamps(
     src: &Path,
     dst: &Path,
     pages: &[Page],
     stamps: &[Stamp],
+    fields: &[crate::forms::Field],
 ) -> Result<(), String> {
     use lopdf::{dictionary, Object, Stream};
     let mut doc =
@@ -522,6 +542,7 @@ pub fn write_stamps(
         contents.push(Object::Reference(after));
         page_dict.set("Contents", Object::Array(contents));
     }
+    crate::forms::write(&mut doc, fields, font_id)?;
     let tmp = dst.with_extension("pdf.part");
     doc.save(&tmp)
         .map_err(|e| format!("cannot write the copy: {e}"))?;
@@ -549,6 +570,8 @@ mod tests {
         assert_eq!(i.pages[1].rot, 90);
         assert_eq!(i.pages[1].x0, 10.0);
         assert_eq!(i.pages[1].shown(), (802.0, 575.0));
+        assert!(!i.form);
+        assert!(parse_info("Form:            AcroForm\nPages: 1\n").form);
     }
 
     #[test]
@@ -568,6 +591,18 @@ mod tests {
         // The shown bottom-right corner is the opposite one.
         assert_eq!(p(0).to_pdf(100.0, 200.0), (100.0, 0.0));
         assert_eq!(p(90).to_pdf(200.0, 100.0), (100.0, 200.0));
+        // And back again, for every rotation and an offset crop box.
+        for rot in [0, 90, 180, 270] {
+            let q = Page {
+                x0: 10.0,
+                y0: 20.0,
+                x1: 110.0,
+                y1: 220.0,
+                rot,
+            };
+            let (x, y) = q.to_pdf(30.0, 40.0);
+            assert_eq!(q.shown_of(x, y), (30.0, 40.0), "rot {rot}");
+        }
     }
 
     #[test]
@@ -677,7 +712,7 @@ mod tests {
             },
         ];
         let dst = dir.join("out.pdf");
-        write_stamps(&src, &dst, &pages, &stamps).unwrap();
+        write_stamps(&src, &dst, &pages, &stamps, &[]).unwrap();
         let written = std::fs::read(&dst).unwrap();
         // The original bytes are kept as they were, the update follows.
         assert!(written.len() > original.len());

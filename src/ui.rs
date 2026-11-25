@@ -1,5 +1,5 @@
 //! Drawing: the picture or the pages, the bars, the gallery, the panels.
-use crate::app::{App, Doc, Drag, Tool, INKS};
+use crate::app::{Adjust, App, Doc, Drag, Tool, INKS};
 use crate::canvas::Rect;
 use crate::jobs::Job;
 use crate::{pdf, picture, theme};
@@ -18,7 +18,8 @@ const HELP: &[(&str, &str)] = &[
     ("I", "details: size, date, camera"),
     ("O", "sort by name, date or size"),
     ("Delete", "move to the trash (asks first)"),
-    ("Ctrl+C", "copy the picture"),
+    ("Ctrl+C", "copy the picture (PDF: the text chosen)"),
+    ("Shift+W", "make the picture the wallpaper"),
     ("", ""),
     ("R  Shift+R", "rotate right, left"),
     ("H  V", "mirror, flip upside down"),
@@ -28,14 +29,23 @@ const HELP: &[(&str, &str)] = &[
     ("X", "pixelate (faces, numbers)"),
     ("K   ,  .", "ink colour, thinner, thicker"),
     ("Ctrl+R", "resize"),
+    ("L", "light: brightness (Up Down), contrast (Left Right)"),
+    ("Z", "straighten: Left Right turn, Enter cuts"),
     ("Ctrl+Z  Ctrl+Y", "undo, redo"),
     ("Ctrl+S", "save a copy (name-edited)"),
     ("Ctrl+Shift+S", "replace the original (asks first)"),
+    ("E", "save as jpg (with a quality), png or webp"),
+    ("Ctrl+L", "save a copy without location and camera"),
     ("", ""),
     ("PDF: S", "put your signature (Shift+S: a new one)"),
     ("PDF: T  D  X", "text, today's date, a cross"),
     ("PDF: drag, corner", "move, resize; Delete removes"),
     ("PDF: Ctrl+S", "save a signed copy (name-signed.pdf)"),
+    ("PDF: Ctrl+F", "find text: Enter next, Shift+Enter back"),
+    ("PDF: Shift+drag", "choose text; Ctrl+C copies it"),
+    ("PDF: E", "fill in the form: click or Tab, Enter"),
+    ("PDF: P", "pages: R turn, Delete, Shift+arrows move"),
+    ("Pages: M  E", "add a PDF at the end, save pages apart"),
     ("Q, Esc", "quit"),
 ];
 
@@ -57,6 +67,7 @@ impl App {
             self.cv.set_clip(v);
             match &self.doc {
                 Doc::Pic(_) => self.draw_picture(),
+                Doc::Pdf(_) if self.pages_view => self.draw_pages(),
                 Doc::Pdf(_) => self.draw_pdf(),
                 Doc::Empty(m) => {
                     let m = m.clone();
@@ -139,6 +150,11 @@ impl App {
                 let row = (sy0 + y) as usize * cw;
                 buf.extend_from_slice(&px[row + sx0 as usize..row + (sx0 + vis.w) as usize]);
             }
+            if let Some(Adjust::Straighten { deg }) = self.adjust {
+                let ch = px.len() / cw.max(1);
+                buf = turned_view(px, cw, ch, (iw, ih), z, deg, (self.ox, self.oy), vis);
+            }
+            light_view(&mut buf, self.adjust);
             self.cv
                 .picture(vis.x, vis.y, vis.w, vis.h, &buf, vis.w as usize, checker);
         } else {
@@ -161,6 +177,11 @@ impl App {
                 let row = sy * iw as usize;
                 buf.extend(cols.iter().map(|c| full[row + c]));
             }
+            if let Some(Adjust::Straighten { deg }) = self.adjust {
+                let (w, h) = (iw as usize, ih as usize);
+                buf = turned_view(full, w, h, (iw, ih), z, deg, (self.ox, self.oy), vis);
+            }
+            light_view(&mut buf, self.adjust);
             self.cv
                 .picture(vis.x, vis.y, vis.w, vis.h, &buf, vis.w as usize, checker);
         }
@@ -190,6 +211,21 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if let Some(Adjust::Straighten { deg }) = self.adjust {
+            // What is kept, and a grid to line the picture up with.
+            let (w, h) = (iw as f64, ih as f64);
+            let k = picture::straighten_keep(w, h, deg);
+            let a = self.to_screen((w * (1.0 - k) / 2.0, h * (1.0 - k) / 2.0));
+            let b = self.to_screen((w * (1.0 + k) / 2.0, h * (1.0 + k) / 2.0));
+            let r = rect_of(a, b);
+            for n in 1..6 {
+                self.cv
+                    .tint(Rect::new(r.x + r.w * n / 6, r.y, 1, r.h), 0xffffff, 110);
+                self.cv
+                    .tint(Rect::new(r.x, r.y + r.h * n / 6, r.w, 1), 0xffffff, 110);
+            }
+            self.cv.dashed(r, accent, 4);
         }
         if let Some((a, b)) = self.crop {
             let r = rect_of(self.to_screen(a), self.to_screen(b));
@@ -257,6 +293,7 @@ impl App {
                     );
                 }
             }
+            self.draw_pdf_marks(i, x, y);
             let Doc::Pdf(d) = &self.doc else { return };
             let stamps: Vec<(usize, pdf::Stamp)> = d
                 .stamps
@@ -426,6 +463,11 @@ impl App {
                 d.image.height(),
                 (self.zoom * 100.0).round()
             ),
+            Doc::Pdf(d) if self.pages_view => format!(
+                "page {} of {}",
+                self.page_sel + 1,
+                d.plan.as_ref().map_or(0, |p| p.sheets.len())
+            ),
             Doc::Pdf(d) => format!(
                 "page {} of {}   {}%",
                 self.current_page(d) + 1,
@@ -473,6 +515,27 @@ impl App {
             }
             return;
         }
+        if let Some((text, state)) = self
+            .find_status()
+            .filter(|_| self.find.as_ref().is_some_and(|f| f.open))
+        {
+            let lw = self.ui.draw(&mut self.cv, 10, by, "Find:", size, p.mark());
+            let tw = self
+                .ui
+                .draw(&mut self.cv, 10 + lw + 8, by, &text, size, p.foreground);
+            self.cv.fill(
+                Rect::new(10 + lw + 8 + tw + 1, by, 2, size.height),
+                p.foreground,
+            );
+            let state = match &self.message {
+                Some((m, _, _)) => m.clone(),
+                None => state,
+            };
+            let sw = self.ui.width(&state, size);
+            let x = (10 + lw + 8 + tw + 24).max(w / 2 - sw / 2);
+            self.ui.draw(&mut self.cv, x, by, &state, size, p.muted);
+            return;
+        }
         let (text, color) = match &self.message {
             Some((m, _, err)) => (m.clone(), if *err { p.error } else { p.foreground }),
             None => (self.hints(), p.muted),
@@ -485,11 +548,21 @@ impl App {
         if self.gallery {
             return "Arrows choose   Enter opens   Esc back   ? help".into();
         }
+        if let Some(a) = &self.adjust {
+            return a.label();
+        }
         match &self.doc {
+            Doc::Pdf(_) if self.pages_view => {
+                "Arrows choose   R Shift+R turn   Delete removes   Shift+arrows move   M add a PDF   E save pages apart   Ctrl+S save   Esc back".into()
+            }
+            Doc::Pdf(_) if self.form => {
+                "Click a field or Tab to it   Enter or Space fills it in   Ctrl+S saves a filled copy   E or Esc done".into()
+            }
             Doc::Pdf(d) if d.sel.is_some() => {
                 "Drag moves   corner resizes   arrows nudge   Delete removes   Ctrl+S saves a signed copy".into()
             }
-            Doc::Pdf(_) => "S sign   T text   D date   X cross   wheel scrolls   Ctrl+S save a signed copy   ? help".into(),
+            Doc::Pdf(d) if d.info.form => "E fill in the form   S sign   T text   D date   Ctrl+F find   P pages   Ctrl+S save a copy   ? help".into(),
+            Doc::Pdf(_) => "S sign   T text   D date   Ctrl+F find   Shift+drag choose text   P pages   Ctrl+S save a copy   ? help".into(),
             Doc::Pic(_) if self.tool != Tool::None => {
                 format!("{}   ink {}   line {} px   Esc done", self.tool.label(), INKS[self.ink].1, self.width)
             }
@@ -536,6 +609,7 @@ impl App {
         let p = self.pal;
         let size = self.ui.size(self.font_px);
         let mut lines: Vec<(String, String)> = Vec::new();
+        let mut warn: Option<usize> = None;
         if let Some(path) = self.doc.path() {
             lines.push(("Name".into(), crate::app::name_of(path)));
             if let Some(dir) = path.parent() {
@@ -564,11 +638,21 @@ impl App {
                     ("Taken", &f.taken),
                     ("Camera", &f.camera),
                     ("Exposure", &f.exposure),
-                    ("Place", &f.place),
                 ] {
                     if let Some(v) = v {
                         lines.push((k.into(), v.clone()));
                     }
+                }
+                let place = f.place.clone().or_else(|| {
+                    (d.xmp_gps == Some(true)).then(|| "in the XMP details".to_string())
+                });
+                if let Some(place) = place {
+                    lines.push(("Location".into(), format!("GPS {place}")));
+                    warn = Some(lines.len());
+                    lines.push((
+                        String::new(),
+                        "shared with the file; Ctrl+L saves a copy without it".into(),
+                    ));
                 }
             }
             Doc::Pdf(d) => {
@@ -607,8 +691,13 @@ impl App {
             let y = r.y + 12 + n as i32 * lh;
             self.ui.draw(&mut self.cv, r.x + 14, y, k, size, p.muted);
             let v = self.ui.ellipsize(v, size, vw);
+            let color = if warn.is_some_and(|w| n + 1 == w || n == w) {
+                p.warning
+            } else {
+                p.foreground
+            };
             self.ui
-                .draw(&mut self.cv, r.x + 14 + kw + 16, y, &v, size, p.foreground);
+                .draw(&mut self.cv, r.x + 14 + kw + 16, y, &v, size, color);
         }
     }
 
@@ -626,8 +715,26 @@ impl App {
             .map(|(_, d)| self.ui.width(d, size))
             .max()
             .unwrap_or(0);
-        let w = (kw + dw + 60).min(self.cv.w - 20);
-        let h = (HELP.len() as i32 * lh + 50).min(self.cv.h - 20);
+        // One column when it fits, else two, split at the blank line nearest
+        // the middle.
+        let one = HELP.len() as i32 * lh + 50 <= self.cv.h - 20;
+        let split = if one {
+            HELP.len()
+        } else {
+            (0..HELP.len())
+                .filter(|i| HELP[*i].0.is_empty())
+                .min_by_key(|i| (*i as i32 - HELP.len() as i32 / 2).abs())
+                .unwrap_or(HELP.len() / 2)
+        };
+        let cols: Vec<&[(&str, &str)]> = if one {
+            vec![HELP]
+        } else {
+            vec![&HELP[..split], &HELP[split + 1..]]
+        };
+        let col_w = kw + dw + 44;
+        let rows = cols.iter().map(|c| c.len()).max().unwrap_or(0) as i32;
+        let w = (col_w * cols.len() as i32 + 16).min(self.cv.w - 20);
+        let h = (rows * lh + 50).min(self.cv.h - 20);
         let r = Rect::new((self.cv.w - w) / 2, (self.cv.h - h) / 2, w, h);
         self.panel(r);
         self.ui.draw(
@@ -638,15 +745,16 @@ impl App {
             size,
             p.mark(),
         );
-        for (n, (k, d)) in HELP.iter().enumerate() {
-            let y = r.y + 36 + n as i32 * lh;
-            if y + lh > r.y + r.h {
-                break;
+        for (c, col) in cols.iter().enumerate() {
+            let x = r.x + 16 + c as i32 * col_w;
+            for (n, (k, d)) in col.iter().enumerate() {
+                let y = r.y + 36 + n as i32 * lh;
+                if y + lh > r.y + r.h {
+                    break;
+                }
+                self.ui.draw(&mut self.cv, x, y, k, size, p.foreground);
+                self.ui.draw(&mut self.cv, x + kw + 24, y, d, size, p.muted);
             }
-            self.ui
-                .draw(&mut self.cv, r.x + 16, y, k, size, p.foreground);
-            self.ui
-                .draw(&mut self.cv, r.x + 16 + kw + 24, y, d, size, p.muted);
         }
     }
 
@@ -717,4 +825,60 @@ pub fn human(n: u64) -> String {
     } else {
         format!("{n} bytes")
     }
+}
+
+/// The picture as it will look with brightness and contrast changed.
+fn light_view(buf: &mut [u32], a: Option<Adjust>) {
+    let Some(Adjust::Light {
+        brightness,
+        contrast,
+    }) = a
+    else {
+        return;
+    };
+    let t = picture::light_table(brightness, contrast);
+    for p in buf.iter_mut() {
+        let (r, g, b) = ((*p >> 16) & 0xff, (*p >> 8) & 0xff, *p & 0xff);
+        *p = (*p & 0xff00_0000)
+            | ((t[r as usize] as u32) << 16)
+            | ((t[g as usize] as u32) << 8)
+            | t[b as usize] as u32;
+    }
+}
+
+/// The part `vis` of the screen with the picture turned by `deg` about its
+/// middle (what straightening does, before the cut), sampled from `src`:
+/// the picture as `sw` x `sh` pixels. `zoom` is screen pixels per picture
+/// pixel and (ox, oy) where the picture's corner is on screen.
+#[allow(clippy::too_many_arguments)]
+fn turned_view(
+    src: &[u32],
+    sw: usize,
+    sh: usize,
+    (iw, ih): (u32, u32),
+    zoom: f64,
+    deg: f64,
+    (ox, oy): (f64, f64),
+    vis: Rect,
+) -> Vec<u32> {
+    let (sn, cs) = deg.to_radians().sin_cos();
+    let (cx, cy) = (iw as f64 / 2.0, ih as f64 / 2.0);
+    let (fx, fy) = (sw as f64 / iw as f64, sh as f64 / ih as f64);
+    let mut out = Vec::with_capacity((vis.w * vis.h) as usize);
+    for y in vis.y..vis.y + vis.h {
+        let dy = (y as f64 + 0.5 - oy) / zoom - cy;
+        for x in vis.x..vis.x + vis.w {
+            let dx = (x as f64 + 0.5 - ox) / zoom - cx;
+            let qx = (cx + dx * cs + dy * sn) * fx;
+            let qy = (cy - dx * sn + dy * cs) * fy;
+            out.push(
+                if qx >= 0.0 && qy >= 0.0 && (qx as usize) < sw && (qy as usize) < sh {
+                    src[qy as usize * sw + qx as usize]
+                } else {
+                    0
+                },
+            );
+        }
+    }
+    out
 }

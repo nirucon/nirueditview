@@ -1,5 +1,5 @@
 //! X11: the window, keys, full screen, files dropped on the window (XDND)
-//! and a picture on the clipboard (image/png).
+//! and a picture (image/png) or text from a PDF on the clipboard.
 use crate::canvas::Canvas;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xproto::*;
@@ -276,26 +276,40 @@ impl X {
         self.flush();
     }
 
-    /// Answer a paste with the PNG bytes. Large pictures go in one property
-    /// when the server takes it (most do up to many megabytes).
-    pub fn answer_png(&self, e: &SelectionRequestEvent, png: &[u8]) {
+    /// Answer a paste: with the PNG bytes of a picture, or with text (from
+    /// a PDF) when there is text. Large pictures go in one property when the
+    /// server takes it (most do up to many megabytes).
+    pub fn answer(&self, e: &SelectionRequestEvent, png: &[u8], text: &str) {
         let a = &self.atoms;
         let prop = if e.property == x11rb::NONE {
             e.target
         } else {
             e.property
         };
+        let string: Atom = AtomEnum::STRING.into();
         let ok = if e.target == a.targets {
+            let offer = if text.is_empty() {
+                vec![a.targets, a.png]
+            } else {
+                vec![a.targets, a.utf8, string]
+            };
             self.c
-                .change_property32(
-                    PropMode::REPLACE,
-                    e.requestor,
-                    prop,
-                    AtomEnum::ATOM,
-                    &[a.targets, a.png],
-                )
+                .change_property32(PropMode::REPLACE, e.requestor, prop, AtomEnum::ATOM, &offer)
                 .is_ok()
-        } else if e.target == a.png && !png.is_empty() {
+        } else if (e.target == a.utf8 || e.target == string) && !text.is_empty() {
+            let max = self.c.maximum_request_bytes().saturating_sub(64);
+            text.len() <= max
+                && self
+                    .c
+                    .change_property8(
+                        PropMode::REPLACE,
+                        e.requestor,
+                        prop,
+                        e.target,
+                        text.as_bytes(),
+                    )
+                    .is_ok()
+        } else if e.target == a.png && !png.is_empty() && text.is_empty() {
             let max = self.c.maximum_request_bytes().saturating_sub(64);
             png.len() <= max
                 && self

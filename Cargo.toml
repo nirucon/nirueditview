@@ -1,10 +1,10 @@
 [package]
 name = "nirueditview"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-description = "Fast picture and PDF viewer for NIRUX with simple editing: crop, rotate, draw, blur, and signatures and text on PDFs"
+description = "Fast picture and PDF viewer for NIRUX with simple editing: crop, rotate, draw, blur, light and straighten; on PDFs signatures, text, forms, search and page edits"
 repository = "https://github.com/nirucon/nirueditview"
 
 [dependencies]

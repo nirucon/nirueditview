@@ -1,7 +1,7 @@
 //! Work off the window's thread: pictures decoded (the one asked for first,
-//! then its neighbours, so turning a page is instant), PDF pages drawn and
-//! thumbnails made. Results come back on a channel, and a pipe wakes the
-//! window's poll.
+//! then its neighbours, so turning a page is instant), PDF pages drawn,
+//! thumbnails made, the words of a PDF read and the wallpaper set.
+//! Results come back on a channel, and a pipe wakes the window's poll.
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -22,13 +22,21 @@ pub enum Job {
     Thumb {
         path: PathBuf,
     },
+    /// Read the words of a PDF (to find and copy text).
+    Words {
+        path: PathBuf,
+    },
+    /// Set a picture as the desktop wallpaper with NIRUWALLPAPER.
+    Wallpaper {
+        path: PathBuf,
+    },
 }
 
 impl Job {
     fn urgent(&self) -> u8 {
         match self {
-            Job::Picture { preload: false, .. } => 0,
-            Job::Page { .. } => 1,
+            Job::Picture { preload: false, .. } | Job::Wallpaper { .. } => 0,
+            Job::Page { .. } | Job::Words { .. } => 1,
             Job::Thumb { .. } => 2,
             Job::Picture { preload: true, .. } => 3,
         }
@@ -39,6 +47,43 @@ pub enum Done {
     Picture(PathBuf, Result<crate::picture::Picture, String>),
     Page(PathBuf, usize, u32, Result<crate::pdf::Raster, String>),
     Thumb(PathBuf, Option<image::RgbaImage>),
+    Words(PathBuf, Result<crate::pdftext::Words, String>),
+    Wallpaper(PathBuf, Result<(), String>),
+}
+
+/// The NIRUWALLPAPER command (`NIRUEDITVIEW_NIRUWALLPAPER` names another,
+/// for tests).
+pub fn wallpaper_command() -> PathBuf {
+    std::env::var_os("NIRUEDITVIEW_NIRUWALLPAPER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "niruwallpaper".into())
+}
+
+/// `niruwallpaper set PATH`: NIRUWALLPAPER hands the picture to niructl,
+/// which keeps it in the shared settings and redraws the desktop.
+pub fn set_wallpaper(path: &std::path::Path) -> Result<(), String> {
+    let out = std::process::Command::new(wallpaper_command())
+        .arg("set")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                "niruwallpaper is not installed (it comes with NIRUX)".to_string()
+            }
+            _ => format!("niruwallpaper: {e}"),
+        })?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .last()
+            .unwrap_or("niruwallpaper failed")
+            .trim_start_matches("niruwallpaper: ")
+            .to_string())
+    }
 }
 
 struct Queue {
@@ -107,6 +152,12 @@ impl Jobs {
                         ),
                         Job::Thumb { path } => {
                             Done::Thumb(path.clone(), crate::files::thumbnail(path))
+                        }
+                        Job::Words { path } => {
+                            Done::Words(path.clone(), crate::pdftext::read(path))
+                        }
+                        Job::Wallpaper { path } => {
+                            Done::Wallpaper(path.clone(), set_wallpaper(path))
                         }
                     };
                     if let Ok(mut g) = q.0.lock() {

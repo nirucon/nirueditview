@@ -116,6 +116,14 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// `~/x` typed in a question is the home folder's `x`.
+pub fn expand_home(p: &Path) -> PathBuf {
+    match p.strip_prefix("~") {
+        Ok(rest) => home().join(rest),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
 fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)

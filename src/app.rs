@@ -3,9 +3,10 @@
 use crate::canvas::{Canvas, Rect};
 use crate::files::{self, Sort};
 use crate::jobs::{Done, Job, Jobs};
+use crate::pdftools::{Find, TextSel};
 use crate::text::Text;
 use crate::x::{keys, X};
-use crate::{pdf, picture, theme};
+use crate::{forms, pdf, pdfpages, pdftext, picture, theme};
 use image::RgbaImage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ pub struct PicDoc {
     pub modified: bool,
     /// Bumped on every change, so the view caches know to redo their work.
     pub generation: u64,
+    /// GPS in XMP: looked for when the details are first shown.
+    pub xmp_gps: Option<bool>,
 }
 
 impl PicDoc {
@@ -72,6 +75,15 @@ pub struct PdfDoc {
     pub pages: HashMap<usize, PageRaster>,
     pub stamps: Vec<pdf::Stamp>,
     pub sel: Option<usize>,
+    /// The words, read when text is first searched or selected.
+    pub words: Option<pdftext::Words>,
+    pub words_asked: bool,
+    /// The form, read when it is first filled in.
+    pub fields: Option<Vec<forms::Field>>,
+    /// The pages view: the new order, what to undo, its thumbnails.
+    pub plan: Option<pdfpages::Plan>,
+    pub plan_undo: Vec<pdfpages::Plan>,
+    pub strip: HashMap<(PathBuf, usize), PageRaster>,
 }
 
 impl PdfDoc {
@@ -96,11 +108,38 @@ impl PdfDoc {
             pages: HashMap::new(),
             stamps: Vec::new(),
             sel: None,
+            words: None,
+            words_asked: false,
+            fields: None,
+            plan: None,
+            plan_undo: Vec::new(),
+            strip: HashMap::new(),
         }
     }
 
+    pub fn fields_changed(&self) -> bool {
+        self.fields
+            .as_ref()
+            .is_some_and(|f| f.iter().any(|f| f.changed))
+    }
+
+    pub fn plan_changed(&self) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|p| !p.untouched(self.info.pages.len()))
+    }
+
     pub fn modified(&self) -> bool {
-        !self.stamps.is_empty()
+        !self.stamps.is_empty() || self.fields_changed() || self.plan_changed()
+    }
+
+    /// Forget what was added, filled in and moved.
+    pub fn discard(&mut self) {
+        self.stamps.clear();
+        self.sel = None;
+        self.fields = None;
+        self.plan = None;
+        self.plan_undo.clear();
     }
 }
 
@@ -182,22 +221,79 @@ pub enum Drag {
         idx: usize,
     },
     Pad,
+    /// Choosing text on a PDF (Shift and a drag); the ends are in `text_sel`.
+    Select,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum After {
     Open(usize),
     Quit,
+    LeavePages,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ask {
     Resize,
-    PicText { at: (f64, f64) },
+    PicText {
+        at: (f64, f64),
+    },
     PdfText,
     Overwrite,
     Trash,
     Unsaved(After),
+    /// Fill in form field `n`.
+    Field(usize),
+    /// A format and quality to save a picture as.
+    SaveAs,
+    /// A PDF whose pages go at the end.
+    Merge,
+    /// Pages saved as a file of their own.
+    Extract,
+}
+
+/// A picture edit shown before it is made: brightness and contrast, or
+/// straightening by a small angle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Adjust {
+    Light { brightness: i32, contrast: i32 },
+    Straighten { deg: f64 },
+}
+
+impl Adjust {
+    fn clamp(self) -> Self {
+        match self {
+            Adjust::Straighten { deg } => Adjust::Straighten {
+                deg: deg.clamp(-20.0, 20.0),
+            },
+            a => a,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Adjust::Light {
+                brightness,
+                contrast,
+            } => format!(
+                "Brightness {brightness:+}   contrast {contrast:+}   (Up Down, Left Right, Shift finer, Enter applies)"
+            ),
+            Adjust::Straighten { deg } => format!(
+                "Straighten {deg:+.1}°   (Left Right, Shift finer, Enter applies, Esc cancels)"
+            ),
+        }
+    }
+}
+
+fn adjust_hint(a: Adjust) -> &'static str {
+    match a {
+        Adjust::Light { .. } => {
+            "Up and Down: brightness, Left and Right: contrast, Shift finer, 0 resets, Enter applies, Esc cancels"
+        }
+        Adjust::Straighten { .. } => {
+            "Left and Right turn the picture (Shift: finer), line it up with the grid, Enter cuts it straight"
+        }
+    }
 }
 
 pub struct Prompt {
@@ -267,6 +363,17 @@ pub struct App {
     pub dirty: bool,
     pub quit: bool,
     pub clip_png: Vec<u8>,
+    pub clip_text: String,
+    pub find: Option<Find>,
+    pub text_sel: Option<TextSel>,
+    /// Filling in the PDF's form (E).
+    pub form: bool,
+    pub field_sel: Option<usize>,
+    /// The pages view of a PDF (P).
+    pub pages_view: bool,
+    pub page_sel: usize,
+    pub strip_scroll: i32,
+    pub adjust: Option<Adjust>,
 }
 
 impl App {
@@ -323,6 +430,15 @@ impl App {
             dirty: true,
             quit: false,
             clip_png: Vec::new(),
+            clip_text: String::new(),
+            find: None,
+            text_sel: None,
+            form: false,
+            field_sel: None,
+            pages_view: false,
+            page_sel: 0,
+            strip_scroll: 0,
+            adjust: None,
         };
         app.open_paths(paths);
         Ok(app)
@@ -384,6 +500,12 @@ impl App {
         self.crop = None;
         self.placing = None;
         self.drag = Drag::None;
+        self.find = None;
+        self.text_sel = None;
+        self.form = false;
+        self.field_sel = None;
+        self.pages_view = false;
+        self.adjust = None;
         self.scaled = None;
         self.full = None;
         self.fit = true;
@@ -480,11 +602,16 @@ impl App {
         self.dirty = true;
     }
 
-    fn ask(&mut self, ask: Ask, label: &str) {
+    pub fn ask(&mut self, ask: Ask, label: &str) {
         let text = match &ask {
             Ask::Resize => "50%".to_string(),
             _ => String::new(),
         };
+        self.ask_with(ask, label, text);
+    }
+
+    /// A question with an answer already written, to change or keep.
+    pub fn ask_with(&mut self, ask: Ask, label: &str, text: String) {
         self.prompt = Some(Prompt {
             ask,
             label: label.to_string(),
@@ -681,6 +808,27 @@ impl App {
                     Err(_) => {}
                 }
             }
+            Done::Page(path, page, dpi, Ok(raster)) if dpi == crate::pdftools::STRIP_DPI => {
+                let px = raster
+                    .rgb
+                    .chunks_exact(3)
+                    .map(|c| {
+                        0xff00_0000 | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
+                    })
+                    .collect();
+                let r = PageRaster {
+                    dpi,
+                    w: raster.w,
+                    h: raster.h,
+                    px,
+                };
+                self.strip_done(path, page, r);
+            }
+            Done::Words(path, r) => self.words_done(path, r),
+            Done::Wallpaper(path, r) => match r {
+                Ok(()) => self.flash(&format!("{} is the wallpaper now", name_of(&path)), false),
+                Err(e) => self.flash(&format!("Wallpaper not set: {e}"), true),
+            },
             Done::Page(path, page, dpi, r) => {
                 if let Doc::Pdf(d) = &mut self.doc {
                     if d.path == path {
@@ -882,20 +1030,28 @@ impl App {
                     }
                 }
             }
+            Doc::Pdf(d) if d.plan_changed() => self.save_pages(),
             Doc::Pdf(d) => {
-                if d.stamps.is_empty() {
-                    self.flash(
-                        "Nothing added yet: S puts your signature, T text, D the date",
-                        false,
-                    );
+                if d.stamps.is_empty() && !d.fields_changed() {
+                    let m = if self.pages_view {
+                        "No page changes yet: R turns, Delete removes, Shift+arrows move"
+                    } else {
+                        "Nothing added yet: S puts your signature, T text, D the date"
+                    };
+                    self.flash(m, false);
                     return false;
                 }
-                let to = pdf::copy_path(&d.path, "signed");
-                match pdf::write_stamps(&d.path, &to, &d.info.pages, &d.stamps) {
+                let suffix = if d.stamps.is_empty() {
+                    "filled"
+                } else {
+                    "signed"
+                };
+                let to = pdf::copy_path(&d.path, suffix);
+                let fields = d.fields.clone().unwrap_or_default();
+                match pdf::write_stamps(&d.path, &to, &d.info.pages, &d.stamps, &fields) {
                     Ok(()) => {
                         let name = name_of(&to);
-                        d.stamps.clear();
-                        d.sel = None;
+                        d.discard();
                         self.after_save(to);
                         self.load_current();
                         self.flash(
@@ -914,7 +1070,168 @@ impl App {
         }
     }
 
-    fn after_save(&mut self, to: PathBuf) {
+    /// Save the picture (as it is now) in another format: `jpg 85`, `png`
+    /// or `webp`. A copy; the original stays.
+    fn save_as(&mut self, text: &str) {
+        let Some((ext, q)) = picture::parse_save_as(text) else {
+            self.flash(
+                "Write jpg, png or webp, and for jpg a quality: jpg 85",
+                true,
+            );
+            return;
+        };
+        let Doc::Pic(d) = &mut self.doc else { return };
+        let to = picture::converted_path(&d.path, ext);
+        match picture::save_with(&d.image, &to, q) {
+            Ok(()) => {
+                let name = name_of(&to);
+                d.path = to.clone();
+                d.modified = false;
+                d.undo.clear();
+                d.redo.clear();
+                self.after_save(to);
+                let how = match ext {
+                    "jpg" => format!(" at quality {q}"),
+                    "webp" => " (lossless)".into(),
+                    _ => String::new(),
+                };
+                self.flash(
+                    &format!("Saved as {name}{how}; the original is unchanged"),
+                    false,
+                );
+            }
+            Err(e) => self.flash(&format!("Not saved: {e}"), true),
+        }
+    }
+
+    /// A copy without where it was taken and without the camera details;
+    /// the picture is the same (and stays upright).
+    fn save_private(&mut self) {
+        let Doc::Pic(d) = &self.doc else { return };
+        let to = pdf::copy_path(&d.path, "private");
+        let r = if d.modified {
+            // Edited pixels are written anew, and nothing of the EXIF goes along.
+            picture::save(&d.image, &to)
+        } else if matches!(picture::ext(&d.path).as_deref(), Some("gif" | "bmp")) {
+            self.flash(
+                "A GIF or BMP picture has no camera details to remove",
+                false,
+            );
+            return;
+        } else {
+            picture::save_private(&d.path, &d.image, &to)
+        };
+        match r {
+            Ok(()) => {
+                let name = name_of(&to);
+                self.after_save(to);
+                if let Doc::Pic(d) = &mut self.doc {
+                    d.modified = false;
+                }
+                self.load_current();
+                self.flash(
+                    &format!("Saved as {name}, without location and camera details"),
+                    false,
+                );
+            }
+            Err(e) => self.flash(&format!("Not saved: {e}"), true),
+        }
+    }
+
+    fn set_wallpaper(&mut self) {
+        let Doc::Pic(d) = &self.doc else { return };
+        if d.modified {
+            self.flash(
+                "Save the picture first (Ctrl+S), then make it the wallpaper",
+                false,
+            );
+            return;
+        }
+        let path = d.path.clone();
+        self.jobs.ask(Job::Wallpaper { path });
+        self.flash("Setting the wallpaper…", false);
+    }
+
+    fn start_adjust(&mut self, a: Adjust) {
+        if !matches!(self.doc, Doc::Pic(_)) {
+            return;
+        }
+        self.tool = Tool::None;
+        self.crop = None;
+        if let Doc::Pic(d) = &mut self.doc {
+            d.next_frame = None;
+        }
+        self.adjust = Some(a);
+        self.flash(adjust_hint(a), false);
+    }
+
+    /// Keys while adjusting: arrows change it, Enter makes it, Esc leaves it.
+    fn adjust_key(&mut self, sym: u32, shift: bool) {
+        let Some(a) = self.adjust else { return };
+        let step = if shift { 1 } else { 5 };
+        let next = match (a, sym) {
+            (_, keys::ESCAPE) => {
+                self.adjust = None;
+                return;
+            }
+            (_, keys::RETURN | keys::KP_ENTER) => {
+                self.adjust = None;
+                match a {
+                    Adjust::Light {
+                        brightness: 0,
+                        contrast: 0,
+                    } => {}
+                    Adjust::Light {
+                        brightness,
+                        contrast,
+                    } => self.edit(|i| Some(picture::light(i, brightness, contrast))),
+                    Adjust::Straighten { deg } if deg.abs() < 0.01 => {}
+                    Adjust::Straighten { deg } => {
+                        self.edit(|i| Some(picture::straighten(i, deg)));
+                        self.fit = true;
+                        self.refit();
+                    }
+                }
+                return;
+            }
+            (Adjust::Light { .. }, keys::BACKSPACE | 0x30) => Adjust::Light {
+                brightness: 0,
+                contrast: 0,
+            },
+            (
+                Adjust::Light {
+                    brightness,
+                    contrast,
+                },
+                keys::UP | keys::DOWN | keys::LEFT | keys::RIGHT,
+            ) => {
+                let (db, dc) = match sym {
+                    keys::UP => (step, 0),
+                    keys::DOWN => (-step, 0),
+                    keys::RIGHT => (0, step),
+                    _ => (0, -step),
+                };
+                Adjust::Light {
+                    brightness: (brightness + db).clamp(-100, 100),
+                    contrast: (contrast + dc).clamp(-100, 100),
+                }
+            }
+            (Adjust::Straighten { .. }, keys::BACKSPACE | 0x30) => Adjust::Straighten { deg: 0.0 },
+            (Adjust::Straighten { deg }, keys::LEFT | keys::RIGHT) => {
+                let d = if shift { 0.1 } else { 0.5 };
+                let d = if sym == keys::RIGHT { d } else { -d };
+                Adjust::Straighten {
+                    deg: ((deg + d) * 10.0).round() / 10.0,
+                }
+                .clamp()
+            }
+            _ => return,
+        };
+        self.adjust = Some(next);
+        self.flash(&next.label(), false);
+    }
+
+    pub fn after_save(&mut self, to: PathBuf) {
         if let Some(dir) = to.parent() {
             self.list = files::list(dir, self.sort);
         }
@@ -962,7 +1279,12 @@ impl App {
     }
 
     pub fn copy_to_clipboard(&mut self) {
+        if matches!(self.doc, Doc::Pdf(_)) {
+            self.copy_text();
+            return;
+        }
         if let Doc::Pic(d) = &self.doc {
+            self.clip_text.clear();
             self.clip_png = picture::png_bytes(d.shown());
             self.x.own_clipboard();
             self.flash("The picture is on the clipboard", false);
@@ -1287,6 +1609,10 @@ impl App {
             self.message = None;
             self.dirty = true;
         }
+        if self.pages_view {
+            self.pages_tick();
+            return;
+        }
         let dpi = self.dpi();
         let v = self.view();
         if let Doc::Pdf(d) = &mut self.doc {
@@ -1336,6 +1662,10 @@ impl App {
                     if self.pad.is_some() && picture::is_picture(p) {
                         let p = p.clone();
                         self.signature_from(&p);
+                    } else if self.pages_view && picture::is_pdf(p) {
+                        for p in paths.clone() {
+                            self.merge(&p);
+                        }
                     } else if !self.doc.modified() {
                         self.open_paths(paths);
                         self.refit();
@@ -1346,9 +1676,7 @@ impl App {
                 self.dirty = true;
             }
             Event::SelectionRequest(e) => {
-                let png = std::mem::take(&mut self.clip_png);
-                self.x.answer_png(&e, &png);
-                self.clip_png = png;
+                self.x.answer(&e, &self.clip_png, &self.clip_text);
             }
             Event::PropertyNotify(e) if e.atom == self.x.atoms.niruwm_theme => {
                 if let Some(name) = self.x.root_theme() {
@@ -1471,12 +1799,56 @@ impl App {
                 _ => return,
             }
         }
+        if self.adjust.is_some() {
+            self.adjust_key(sym, shift);
+            return;
+        }
+        if self.find_key(sym, shift) {
+            return;
+        }
         if self.gallery && self.gallery_key(sym) {
+            return;
+        }
+        if self.pages_view {
+            if self.pages_key(sym, ctrl, shift) {
+                return;
+            }
+            // Only saving, quitting, help and full screen go on from here.
+            let on = (ctrl && matches!(sym, 0x73 | 0x53 | 0x71 | 0x77))
+                || (!ctrl && matches!(sym, 0x3f | 0x71 | 0x66 | keys::F1 | keys::F11));
+            if !on {
+                self.dirty = false;
+                return;
+            }
+        }
+        if self.form && self.form_key(sym, shift) {
             return;
         }
         let is_pdf = matches!(self.doc, Doc::Pdf(_));
         let is_pic = matches!(self.doc, Doc::Pic(_));
         match (sym, ctrl) {
+            (0x66, true) if is_pdf => self.open_find(),
+            (0x6c, true) if is_pic => self.save_private(),
+            (0x6c, false) if is_pic => self.start_adjust(Adjust::Light {
+                brightness: 0,
+                contrast: 0,
+            }),
+            (0x7a, false) if is_pic => self.start_adjust(Adjust::Straighten { deg: 0.0 }),
+            (0x65, false) if is_pic => {
+                let now = match self.doc.path().and_then(picture::ext).as_deref() {
+                    Some("jpg" | "jpeg" | "jpe" | "jfif") => "jpg 90",
+                    Some("webp") => "webp",
+                    _ => "png",
+                };
+                self.ask_with(
+                    Ask::SaveAs,
+                    "Save as jpg, png or webp (jpg with a quality from 1 to 100):",
+                    now.to_string(),
+                );
+            }
+            (0x65, false) if is_pdf => self.toggle_form(),
+            (0x57, false) if is_pic => self.set_wallpaper(),
+            (0x70, false) if is_pdf => self.toggle_pages(),
             (0x73, true) | (0x53, true) if shift && is_pic => self.ask(
                 Ask::Overwrite,
                 "Replace the original? Camera details (EXIF) are not kept. Y replaces, Esc keeps it",
@@ -1490,7 +1862,11 @@ impl App {
             (0x72, true) if is_pic => self.ask(Ask::Resize, "New size (50%, 1920x1080 or a width):"),
             (0x71, true) | (0x77, true) => self.want_quit(),
             (keys::ESCAPE, _) => {
-                if self.placing.take().is_some() || self.crop.take().is_some() {
+                if self.placing.take().is_some()
+                    || self.crop.take().is_some()
+                    || self.text_sel.take().is_some()
+                    || self.find.take().is_some()
+                {
                 } else if !matches!(self.drag, Drag::None) {
                     self.drag = Drag::None;
                 } else if self.tool != Tool::None {
@@ -1517,7 +1893,14 @@ impl App {
             }
             (0x71, false) => self.want_quit(),
             (keys::F1, _) | (0x3f, _) => self.help = !self.help,
-            (0x69, false) => self.info = !self.info,
+            (0x69, false) => {
+                self.info = !self.info;
+                if let Doc::Pic(d) = &mut self.doc {
+                    if self.info && d.xmp_gps.is_none() && d.facts.place.is_none() {
+                        d.xmp_gps = Some(picture::xmp_location(&d.path));
+                    }
+                }
+            }
             (0x66, false) | (keys::F11, _) => {
                 self.x.toggle_fullscreen();
             }
@@ -1673,7 +2056,7 @@ impl App {
                 0x64 | 0x44 => {
                     match &mut self.doc {
                         Doc::Pic(d) => d.modified = false,
-                        Doc::Pdf(d) => d.stamps.clear(),
+                        Doc::Pdf(d) => d.discard(),
                         _ => {}
                     }
                     self.continue_after(after);
@@ -1711,6 +2094,11 @@ impl App {
     fn continue_after(&mut self, after: After) {
         match after {
             After::Quit => self.quit = true,
+            After::LeavePages => {
+                if self.pages_view {
+                    self.leave_pages();
+                }
+            }
             After::Open(i) => {
                 self.index = i.min(self.list.len().saturating_sub(1));
                 self.load_current();
@@ -1753,6 +2141,10 @@ impl App {
                 self.edit(|_| Some(img));
             }
             Ask::PdfText if !text.is_empty() => self.place_text(text, 11.0),
+            Ask::Field(i) => self.field_submit(i, &p.text),
+            Ask::SaveAs => self.save_as(&text),
+            Ask::Merge if !text.is_empty() => self.merge(Path::new(&text)),
+            Ask::Extract if !text.is_empty() => self.extract(&text),
             _ => {}
         }
     }
@@ -1852,7 +2244,9 @@ impl App {
         match e.detail {
             4 | 5 => {
                 let up = e.detail == 4;
-                if self.gallery {
+                if self.pages_view {
+                    self.strip_scroll = (self.strip_scroll + if up { -80 } else { 80 }).max(0);
+                } else if self.gallery {
                     self.gallery_scroll = (self.gallery_scroll + if up { -80 } else { 80 }).max(0);
                 } else if matches!(self.doc, Doc::Pdf(_)) && !ctrl {
                     self.scroll_by(if up { -80.0 } else { 80.0 });
@@ -1901,6 +2295,13 @@ impl App {
             }
             return;
         }
+        if self.pages_view {
+            self.pages_click(x, y);
+            return;
+        }
+        if self.form && self.form_click(x, y) {
+            return;
+        }
         if let Some(pl) = self.placing.take() {
             if let Doc::Pdf(d) = &mut self.doc {
                 d.stamps.push(pl.stamp);
@@ -1920,6 +2321,13 @@ impl App {
                     oy: self.oy,
                     scroll: self.scroll,
                 };
+                if hit.is_none() && e.state.contains(KeyButMask::SHIFT) {
+                    if let Some((page, u, v)) = at {
+                        self.start_select(page, u, v);
+                        return;
+                    }
+                }
+                self.text_sel = None;
                 let Doc::Pdf(d) = &mut self.doc else { return };
                 if let Some((i, corner)) = hit {
                     d.sel = Some(i);
@@ -1969,6 +2377,10 @@ impl App {
         let zoom = self.zoom;
         match &mut self.drag {
             Drag::None => return,
+            Drag::Select => {
+                self.select_to(x, y);
+                return;
+            }
             Drag::Press {
                 x: px,
                 y: py,
@@ -2072,6 +2484,11 @@ impl App {
     }
 
     fn release(&mut self, _x: i32, _y: i32) {
+        if matches!(self.drag, Drag::Select) {
+            self.drag = Drag::None;
+            self.end_select();
+            return;
+        }
         if matches!(self.drag, Drag::Pad) {
             self.drag = Drag::None;
             return;
@@ -2097,6 +2514,7 @@ fn pic_doc(path: PathBuf, pic: picture::Picture) -> PicDoc {
         redo: Vec::new(),
         modified: false,
         generation: 1,
+        xmp_gps: None,
     }
 }
 

@@ -4,8 +4,12 @@
 mod app;
 mod canvas;
 mod files;
+mod forms;
 mod jobs;
 mod pdf;
+mod pdfpages;
+mod pdftext;
+mod pdftools;
 mod picture;
 mod text;
 mod theme;
@@ -19,8 +23,10 @@ nirueditview [FILE|FOLDER]...   show pictures and PDFs (a folder opens its galle
 nirueditview --version
 
 Keys: ? in the window. Pictures: arrows turn, G gallery, S slideshow, R rotate,
-C crop, P pen, X pixelate, Ctrl+S saves a copy. PDF: S signature, T text,
-D date, Ctrl+S saves a signed copy. The original is kept unless you choose
+C crop, P pen, X pixelate, L light, Z straighten, E save as, Ctrl+L a copy
+without location, Shift+W wallpaper, Ctrl+S saves a copy. PDF: S signature,
+T text, D date, Ctrl+F find, Shift+drag and Ctrl+C copy text, E fill in the
+form, P pages, Ctrl+S saves a copy. The original is kept unless you choose
 Ctrl+Shift+S (pictures).";
 
 fn main() -> ExitCode {
