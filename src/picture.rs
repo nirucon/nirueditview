@@ -380,10 +380,10 @@ pub fn straighten(img: &RgbaImage, deg: f64) -> RgbaImage {
         let (x0, y0) = (sx.floor(), sy.floor());
         let (fx, fy) = (sx - x0, sy - y0);
         let (x0, y0) = (x0 as i64, y0 as i64);
-        for c in 0..4 {
+        for (c, v) in p.0.iter_mut().enumerate() {
             let top = px(x0, y0, c) * (1.0 - fx) + px(x0 + 1, y0, c) * fx;
             let bottom = px(x0, y0 + 1, c) * (1.0 - fx) + px(x0 + 1, y0 + 1, c) * fx;
-            p.0[c] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+            *v = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
         }
     }
     out
